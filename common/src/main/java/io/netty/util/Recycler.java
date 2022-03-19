@@ -23,6 +23,7 @@ import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import org.jctools.queues.MessagePassingQueue;
 
+import java.lang.ref.SoftReference;
 import java.util.ArrayDeque;
 import java.util.Queue;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
@@ -102,7 +103,7 @@ public abstract class Recycler<T> {
         @Override
         protected void onRemoval(LocalPool<T> value) throws Exception {
             super.onRemoval(value);
-            MessagePassingQueue<DefaultHandle<T>> handles = value.pooledHandles;
+            MessagePassingQueue<SoftReferenceHandle<T>> handles = value.pooledHandles;
             value.pooledHandles = null;
             handles.clear();
         }
@@ -168,8 +169,9 @@ public abstract class Recycler<T> {
         DefaultHandle<T> handle = localPool.claim();
         T obj;
         if (handle == null) {
-            handle = localPool.newHandle();
-            if (handle != null) {
+            SoftReferenceHandle<T> softReferenceHandle = localPool.newHandle();
+            DefaultHandle<T> defaultHandle = softReferenceHandle.get();
+            if (defaultHandle != null) {
                 obj = newObject(handle);
                 handle.set(obj);
             } else {
@@ -202,12 +204,15 @@ public abstract class Recycler<T> {
     protected abstract T newObject(Handle<T> handle);
 
     @SuppressWarnings("ClassNameSameAsAncestorName") // Can't change this due to compatibility.
-    public interface Handle<T> extends ObjectPool.Handle<T>  { }
+    public interface Handle<T> extends ObjectPool.Handle<T> {
+    }
 
     private static final class DefaultHandle<T> implements Handle<T> {
         private static final int STATE_CLAIMED = 0;
         private static final int STATE_AVAILABLE = 1;
         private static final AtomicIntegerFieldUpdater<DefaultHandle<?>> STATE_UPDATER;
+        private SoftReferenceHandle<T> softReferenceHandle;
+
         static {
             AtomicIntegerFieldUpdater<?> updater = AtomicIntegerFieldUpdater.newUpdater(DefaultHandle.class, "state");
             //noinspection unchecked
@@ -228,7 +233,7 @@ public abstract class Recycler<T> {
             if (object != value) {
                 throw new IllegalArgumentException("object does not belong to handle");
             }
-            localPool.release(this);
+            localPool.release(softReferenceHandle);
         }
 
         T get() {
@@ -237,6 +242,10 @@ public abstract class Recycler<T> {
 
         void set(T value) {
             this.value = value;
+        }
+
+        void setSoftReferenceHandle(SoftReferenceHandle<T> softReferenceHandle) {
+            this.softReferenceHandle = softReferenceHandle;
         }
 
         boolean availableToClaim() {
@@ -256,47 +265,70 @@ public abstract class Recycler<T> {
 
     private static final class LocalPool<T> {
         private final int ratioInterval;
-        private volatile MessagePassingQueue<DefaultHandle<T>> pooledHandles;
+        private volatile MessagePassingQueue<SoftReferenceHandle<T>> pooledHandles;
         private int ratioCounter;
 
         @SuppressWarnings("unchecked")
         LocalPool(int maxCapacity, int ratioInterval, int chunkSize) {
             this.ratioInterval = ratioInterval;
             if (BLOCKING_POOL) {
-                pooledHandles = new BlockingMessageQueue<DefaultHandle<T>>(maxCapacity);
+                pooledHandles = new BlockingMessageQueue<SoftReferenceHandle<T>>(maxCapacity);
             } else {
-                pooledHandles = (MessagePassingQueue<DefaultHandle<T>>) newMpscQueue(chunkSize, maxCapacity);
+                pooledHandles = (MessagePassingQueue<SoftReferenceHandle<T>>) newMpscQueue(chunkSize, maxCapacity);
             }
             ratioCounter = ratioInterval; // Start at interval so the first one will be recycled.
         }
 
         DefaultHandle<T> claim() {
-            MessagePassingQueue<DefaultHandle<T>> handles = pooledHandles;
+            MessagePassingQueue<SoftReferenceHandle<T>> handles = pooledHandles;
             if (handles == null) {
                 return null;
             }
-            DefaultHandle<T> handle;
+            DefaultHandle<T> returnHandle;
+            SoftReferenceHandle<T> softReferenceHandle;
             do {
-                handle = handles.relaxedPoll();
-            } while (handle != null && !handle.availableToClaim());
-            return handle;
+                softReferenceHandle = handles.relaxedPoll();
+            } while ((returnHandle = softReferenceHandle.get()) != null && !returnHandle.availableToClaim());
+            return returnHandle;
         }
 
-        void release(DefaultHandle<T> handle) {
-            MessagePassingQueue<DefaultHandle<T>> handles = pooledHandles;
-            handle.toAvailable();
+        void release(SoftReferenceHandle<T> handle) {
+            MessagePassingQueue<SoftReferenceHandle<T>> handles = pooledHandles;
+            DefaultHandle<T> defaultHandle = handle.get();
+            if (defaultHandle == null) {
+                return;
+            }
+            defaultHandle.toAvailable();
             if (handles != null) {
                 handles.relaxedOffer(handle);
             }
         }
 
-        DefaultHandle<T> newHandle() {
+        SoftReferenceHandle<T> newHandle() {
             if (++ratioCounter >= ratioInterval) {
                 ratioCounter = 0;
-                return new DefaultHandle<T>(this);
+                return new SoftReferenceHandle<T>(new DefaultHandle<T>(this));
             }
             return null;
         }
+    }
+
+    private static final class SoftReferenceHandle<T> extends SoftReference<DefaultHandle<T>> implements Handle<T> {
+
+        public SoftReferenceHandle(DefaultHandle<T> referent) {
+            super(referent);
+            referent.setSoftReferenceHandle(this);
+        }
+
+        @Override
+        public void recycle(T self) {
+            DefaultHandle<T> defaultHandle = get();
+            if (defaultHandle == null) {
+                return;
+            }
+            defaultHandle.recycle(self);
+        }
+
     }
 
     /**
