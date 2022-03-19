@@ -172,7 +172,7 @@ public abstract class Recycler<T> {
             SoftReferenceHandle<T> softReferenceHandle = localPool.newHandle();
             DefaultHandle<T> defaultHandle = softReferenceHandle.get();
             if (defaultHandle != null) {
-                obj = newObject(handle);
+                obj = newObject(softReferenceHandle);
                 handle.set(obj);
             } else {
                 obj = newObject((Handle<T>) NOOP_HANDLE);
